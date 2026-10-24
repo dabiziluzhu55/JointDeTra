@@ -35,6 +35,8 @@ class DataConfig:
     voxel_size_m: float = 0.1
     z_range_m: tuple[float, float] = (-4.0, 8.0)
     class_names: tuple[str, ...] = ("VEHICLE", "PEDESTRIAN", "CYCLIST")
+    # ``waymo``: gt_types are Waymo enum ids (1/2/4). ``contiguous``: already 0..C-1.
+    class_id_mode: str = "waymo"
 
 
 @dataclass(frozen=True)

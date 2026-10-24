@@ -309,10 +309,17 @@ def compute_metrics(
     per_class_metrics: dict[str, torch.Tensor] = {}
     gt_types_q = aligned.get("query_gt_types")
     if gt_types_q is not None:
-        class_ids = waymo_types_to_class_indices(gt_types_q)  # [B,N] -> 0/1/2
+        class_id_mode = str(targets.get("class_id_mode", "waymo"))
+        class_ids = waymo_types_to_class_indices(gt_types_q, class_id_mode)
         minade_best = ade_by_mode.min(dim=2).values
         minfde_best = fde_by_mode.min(dim=2).values
-        for cname, cid in (("veh", 0), ("ped", 1), ("cyc", 2)):
+        if class_id_mode == "contiguous":
+            from detra_repro.data.resolve_taxonomy import CLASS_NAMES
+
+            name_ids = tuple((name, idx) for idx, name in enumerate(CLASS_NAMES))
+        else:
+            name_ids = (("veh", 0), ("ped", 1), ("cyc", 2))
+        for cname, cid in name_ids:
             cls_q = valid_query & (class_ids == cid)
             if bool(cls_q.any()):
                 per_class_metrics[f"minade_k6_{cname}"] = minade_best[cls_q].mean().detach()

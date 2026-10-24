@@ -137,13 +137,21 @@ def _axis_aligned_bev(boxes: torch.Tensor) -> torch.Tensor:
     return torch.cat([boxes[..., :2] - half, boxes[..., :2] + half], dim=-1)
 
 
-def waymo_types_to_class_indices(gt_types: torch.Tensor) -> torch.Tensor:
-    """Map Waymo laser-label enum ids to contiguous class ids.
+def waymo_types_to_class_indices(
+    gt_types: torch.Tensor,
+    class_id_mode: str = "waymo",
+) -> torch.Tensor:
+    """Map cached type ids to contiguous class indices.
 
-    Returns class ids in ``{0: vehicle, 1: pedestrian, 2: cyclist}``. Unknown
-    or missing values default to vehicle for backwards-compatible old caches.
+    ``waymo`` maps enum ids ``{1: vehicle, 2: pedestrian, 4: cyclist}``.
+    Unknown values default to vehicle so old caches keep working.
+    ``contiguous`` returns ``gt_types`` unchanged (RESOLVE 0..C-1).
     """
 
+    if class_id_mode == "contiguous":
+        return gt_types.long()
+    if class_id_mode != "waymo":
+        raise ValueError("class_id_mode must be 'waymo' or 'contiguous'")
     out = torch.zeros_like(gt_types, dtype=torch.long)
     out = torch.where(gt_types == 2, torch.ones_like(out), out)
     out = torch.where(gt_types == 4, torch.full_like(out, 2), out)
@@ -633,6 +641,7 @@ def detection_loss(
     class_weight: float = 1.0,
     z_weight: float = 0.0,
     height_weight: float = 0.0,
+    class_id_mode: str = "waymo",
 ) -> dict[str, torch.Tensor]:
     """Detection classification and matched box regression loss.
 
@@ -676,7 +685,10 @@ def detection_loss(
         z_l1 = F.smooth_l1_loss(pm[:, 2], gm[:, 2])
         height_l1 = F.smooth_l1_loss(pm[:, 5], gm[:, 5])
         if "class_logits" in pred:
-            class_targets = waymo_types_to_class_indices(aligned["query_gt_types"][matched])
+            class_targets = waymo_types_to_class_indices(
+                aligned["query_gt_types"][matched],
+                class_id_mode,
+            )
             class_ce = F.cross_entropy(pred["class_logits"][matched], class_targets)
         else:
             class_ce = pred["object_logits"].sum() * 0.0
@@ -1300,6 +1312,7 @@ def detra_loss(
             gt_velocity=gt_velocity,
             gt_velocity_valid=gt_velocity_valid,
         )
+        class_id_mode = getattr(data_cfg, "class_id_mode", "waymo") if data_cfg is not None else "waymo"
         det = detection_loss(
             output,
             aligned,
@@ -1308,6 +1321,7 @@ def detra_loss(
             class_weight=detection_class_weight,
             z_weight=detection_z_weight,
             height_weight=detection_height_weight,
+            class_id_mode=class_id_mode,
         )
         forecast_targets = aligned["query_object_targets"]
         forecast_candidate_targets = forecast_targets.clone()

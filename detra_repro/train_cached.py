@@ -444,6 +444,7 @@ def forward_batch(
         targets["history_occupancy_count"] = history_occupancy.bool().float().sum()
     if history_motion_targets is not None:
         targets["dense_history_motion_cells"] = history_motion_targets["flow_mask"].float().sum()
+    targets["class_id_mode"] = data_cfg.class_id_mode
     return pred, losses, targets
 
 
@@ -986,6 +987,8 @@ def train_cached(
     past_target_frac: float = 0.0,
     motion_target_frac: float = 0.0,
     yaw_target_frac: float = 0.0,
+    num_classes: int = 3,
+    class_id_mode: str = "waymo",
     run_dir: str | Path | None = None,
     comet: bool = False,
     comet_project: str | None = None,
@@ -1058,7 +1061,7 @@ def train_cached(
         comet_run_name=comet_run_name,
         comet_tags=comet_tags or [],
     )
-    data_cfg = DataConfig(roi_m=roi, voxel_size_m=voxel_size)
+    data_cfg = DataConfig(roi_m=roi, voxel_size_m=voxel_size, class_id_mode=class_id_mode)
 
     # Need future + past horizons before constructing ModelConfig.
     train_dataset_probe = CachedWaymoDataset(train_cache)
@@ -1072,6 +1075,7 @@ def train_cached(
     occupancy_channels = history_steps + (future_steps if occ_aux_future else 0)
     model_cfg = ModelConfig(
         num_queries=num_queries,
+        num_classes=num_classes,
         num_refinement_blocks=num_refinement_blocks,
         num_times=future_steps + 1,
         deformable_radius_m=deformable_radius_m,
@@ -2619,6 +2623,8 @@ if __name__ == "__main__":
         ),
     )
     parser.add_argument("--num-queries", type=int, default=600)
+    parser.add_argument("--num-classes", type=int, default=3)
+    parser.add_argument("--class-id-mode", choices=("waymo", "contiguous"), default="waymo")
     parser.add_argument("--num-refinement-blocks", type=int, default=3)
     parser.add_argument("--deformable-radius-m", type=float, default=2.0)
     parser.add_argument("--attention-type", choices=("deformable", "center"), default="deformable")
@@ -2854,6 +2860,8 @@ if __name__ == "__main__":
         past_target_frac=args.past_target_frac,
         motion_target_frac=args.motion_target_frac,
         yaw_target_frac=args.yaw_target_frac,
+        num_classes=args.num_classes,
+        class_id_mode=args.class_id_mode,
         run_dir=args.run_dir,
         comet=args.comet,
         comet_project=args.comet_project,

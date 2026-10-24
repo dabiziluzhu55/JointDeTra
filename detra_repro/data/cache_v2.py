@@ -80,15 +80,23 @@ def _sample_arrays(sample: SceneSample, source_tfrecord: str) -> dict[str, Any]:
     }
 
 
-def atomic_save_sample(path: str | Path, sample: SceneSample, source_tfrecord: str) -> None:
+def atomic_save_sample(
+    path: str | Path,
+    sample: SceneSample,
+    source_tfrecord: str,
+    extras: dict[str, Any] | None = None,
+) -> None:
     """Write one NPZ completely before atomically publishing its final path."""
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    arrays = _sample_arrays(sample, source_tfrecord)
+    if extras:
+        arrays.update(extras)
     try:
         with tmp.open("wb") as handle:
-            np.savez_compressed(handle, **_sample_arrays(sample, source_tfrecord))
+            np.savez_compressed(handle, **arrays)
             handle.flush()
             os.fsync(handle.fileno())
         os.replace(tmp, path)
