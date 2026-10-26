@@ -16,6 +16,7 @@ import argparse
 import json
 import random
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -71,7 +72,7 @@ class Sequence:
 
 
 def resolve_data_config() -> DataConfig:
-    return DataConfig(
+    cfg = DataConfig(
         history_sweeps=HISTORY_SWEEPS,
         future_steps=FUTURE_STEPS,
         frame_stride=FRAME_STRIDE,
@@ -80,6 +81,26 @@ def resolve_data_config() -> DataConfig:
         z_range_m=Z_RANGE_M,
         class_names=CLASS_NAMES,
         class_id_mode="contiguous",
+    )
+    height = int(round((cfg.roi_m[3] - cfg.roi_m[1]) / cfg.voxel_size_m))
+    width = int(round((cfg.roi_m[2] - cfg.roi_m[0]) / cfg.voxel_size_m))
+    if height % 16 or width % 16:
+        raise ValueError(f"BEV grid {(height, width)} is not divisible by encoder stride 16")
+    return cfg
+
+
+def _inside_xyz(xyz: np.ndarray, cfg: DataConfig) -> np.ndarray:
+    """Inclusive range, matching OpenPCDet ``mask_points_by_range`` plus z."""
+
+    x_min, y_min, x_max, y_max = cfg.roi_m
+    z_min, z_max = cfg.z_range_m
+    return (
+        (xyz[:, 0] >= x_min)
+        & (xyz[:, 0] <= x_max)
+        & (xyz[:, 1] >= y_min)
+        & (xyz[:, 1] <= y_max)
+        & (xyz[:, 2] >= z_min)
+        & (xyz[:, 2] <= z_max)
     )
 
 
@@ -381,13 +402,13 @@ def make_sample(
     frame_pos: int,
     track_at: dict[tuple[str, int], int],
     cfg: DataConfig,
-) -> SceneSample | None:
+    *,
+    filter_boxes_outside_range: bool = True,
+) -> tuple[SceneSample, np.ndarray] | None:
     frame = seq.frames[frame_pos]
     current_path = _lidar_path(root, seq, frame)
     if not current_path.exists():
         return None
-    x_min, y_min, x_max, y_max = cfg.roi_m
-    z_min, z_max = cfg.z_range_m
     sweeps = []
     current_xyz = None
     first = frame_pos - cfg.history_sweeps + 1
@@ -402,15 +423,7 @@ def make_sample(
             continue
         if sweep_pos == frame_pos:
             current_xyz = xyz[:, :3]
-        keep = (
-            (xyz[:, 0] >= x_min)
-            & (xyz[:, 0] < x_max)
-            & (xyz[:, 1] >= y_min)
-            & (xyz[:, 1] < y_max)
-            & (xyz[:, 2] >= z_min)
-            & (xyz[:, 2] < z_max)
-        )
-        kept = xyz[keep]
+        kept = xyz[_inside_xyz(xyz[:, :3], cfg)]
         dt_col = np.full((len(kept), 1), dt, dtype=np.float32)
         sweeps.append(np.concatenate([kept[:, :3], dt_col], axis=1))
     points = np.concatenate(sweeps, axis=0) if sweeps else np.zeros((0, 4), dtype=np.float32)
@@ -424,14 +437,10 @@ def make_sample(
     else:
         point_counts = _count_points(current_xyz, boxes)
     keep = point_counts > 0
-    if len(boxes):
-        in_roi = (
-            (boxes[:, 0] >= x_min)
-            & (boxes[:, 0] < x_max)
-            & (boxes[:, 1] >= y_min)
-            & (boxes[:, 1] < y_max)
-        )
-        keep = keep & in_roi
+    # OpenPCDet drops out-of-range centers only while training. Val/test keep
+    # them so detection GT matches the official eval infos.
+    if filter_boxes_outside_range and len(boxes):
+        keep = keep & _inside_xyz(boxes[:, :3], cfg)
     boxes = boxes[keep]
     class_ids = class_ids[keep]
     track_ids = track_ids[keep]
@@ -492,6 +501,44 @@ def make_sample(
     ), velocity
 
 
+def _cache_sequence_job(job: tuple) -> dict:
+    """Write one sequence. Returns counts and the best preview frame, not points."""
+
+    root, seq, split_dir, limit, filter_outside = job
+    cfg = resolve_data_config()
+    track_at = _track_index(seq)
+    n_samples = 0
+    best: tuple | None = None
+    seg_dir = Path(split_dir) / seq.batch_id
+    for frame_pos in range(limit):
+        built = make_sample(
+            Path(root),
+            seq,
+            frame_pos,
+            track_at,
+            cfg,
+            filter_boxes_outside_range=filter_outside,
+        )
+        if built is None:
+            continue
+        sample, velocity = built
+        dest = seg_dir / f"sample_{sample.frame_index:06d}.npz"
+        atomic_save_sample(
+            dest,
+            sample,
+            str(_lidar_path(Path(root), seq, seq.frames[frame_pos])),
+            extras={
+                "gt_velocity": velocity.astype(np.float32),
+                "gt_class_names": np.asarray(CLASS_NAMES),
+            },
+        )
+        n_samples += 1
+        score = _preview_score(sample)
+        if best is None or score > best[0]:
+            best = (score, frame_pos)
+    return {"batch_id": seq.batch_id, "n_samples": n_samples, "best": best}
+
+
 def cache_sequences(
     root: str | Path,
     split_json: str | Path,
@@ -500,6 +547,7 @@ def cache_sequences(
     max_sequences: int = 0,
     max_frames: int = 0,
     sample_out: str | Path | None = None,
+    workers: int = 8,
 ) -> dict[str, int]:
     root = Path(root)
     out_root = Path(out_root)
@@ -513,31 +561,48 @@ def cache_sequences(
         if max_sequences > 0:
             batch_ids = sorted(batch_ids, key=lambda item: sequences[item].num_frames)[:max_sequences]
         split_dir = out_root / split
-        n_samples = 0
+        split_dir.mkdir(parents=True, exist_ok=True)
+        filter_outside = split == "train"
+        jobs = []
         for batch_id in batch_ids:
             seq = sequences[batch_id]
-            track_at = _track_index(seq)
             limit = seq.num_frames if max_frames <= 0 else min(max_frames, seq.num_frames)
-            seg_dir = split_dir / batch_id
-            for frame_pos in range(limit):
-                built = make_sample(root, seq, frame_pos, track_at, cfg)
-                if built is None:
-                    continue
+            jobs.append((str(root), seq, str(split_dir), limit, filter_outside))
+        n_samples = 0
+        done = 0
+        best_job: tuple | None = None
+        pool_workers = max(1, min(workers, len(jobs)))
+        with ProcessPoolExecutor(max_workers=pool_workers) as pool:
+            futures = [pool.submit(_cache_sequence_job, job) for job in jobs]
+            for future in as_completed(futures):
+                result = future.result()
+                done += 1
+                n_samples += int(result["n_samples"])
+                best = result["best"]
+                if best is not None and (best_job is None or best[0] > best_job[0]):
+                    best_job = (best[0], result["batch_id"], best[1])
+                if done % 10 == 0 or done == len(jobs):
+                    print(
+                        f"{split}: {done}/{len(jobs)} sequences, {n_samples} frames",
+                        flush=True,
+                    )
+        if best_job is not None:
+            _, batch_id, frame_pos = best_job
+            seq = sequences[batch_id]
+            built = make_sample(
+                root,
+                seq,
+                frame_pos,
+                _track_index(seq),
+                cfg,
+                filter_boxes_outside_range=filter_outside,
+            )
+            if built is not None:
                 sample, velocity = built
-                dest = seg_dir / f"sample_{sample.frame_index:06d}.npz"
-                atomic_save_sample(
-                    dest,
-                    sample,
-                    str(_lidar_path(root, seq, seq.frames[frame_pos])),
-                    extras={
-                        "gt_velocity": velocity.astype(np.float32),
-                        "gt_class_names": np.asarray(CLASS_NAMES),
-                    },
-                )
-                n_samples += 1
-                score = _preview_score(sample)
-                if preview is None or score > preview[0]:
-                    preview = (score, dest, sample, velocity, seq, seq.frames[frame_pos])
+                dest = split_dir / batch_id / f"sample_{sample.frame_index:06d}.npz"
+                candidate = (_preview_score(sample), dest, sample, velocity, seq, seq.frames[frame_pos])
+                if preview is None or candidate[0] > preview[0]:
+                    preview = candidate
         manifest = {
             "cache_schema_version": CACHE_SCHEMA_VERSION,
             "dataset": "RESOLVE",
@@ -551,9 +616,11 @@ def cache_sequences(
             "max_sequences": max_sequences,
             "max_frames": max_frames,
             "config": {
+                "point_cloud_range": [cfg.roi_m[0], cfg.roi_m[1], cfg.z_range_m[0], cfg.roi_m[2], cfg.roi_m[3], cfg.z_range_m[1]],
                 "roi_m": list(cfg.roi_m),
                 "z_range_m": list(cfg.z_range_m),
                 "voxel_size_m": cfg.voxel_size_m,
+                "filter_boxes_outside_range": split == "train",
                 "history_sweeps": cfg.history_sweeps,
                 "future_steps": cfg.future_steps,
                 "frame_stride": cfg.frame_stride,
@@ -617,6 +684,7 @@ def export_preview(sample_out, npz_path, sample: SceneSample, velocity, seq: Seq
         "stem": frame.stem,
         "timestamp_s": frame.timestamp_s,
         "lidar_dir": LIDAR_DIR,
+        "point_cloud_range_xyz": [ROI_M[0], ROI_M[1], Z_RANGE_M[0], ROI_M[2], ROI_M[3], Z_RANGE_M[1]],
         "hd_map_tokens": 0,
         "ego_pose": "identity",
         "num_points": int(len(pts)),
@@ -651,6 +719,7 @@ def main() -> None:
     cache_parser.add_argument("--max-sequences", type=int, default=0)
     cache_parser.add_argument("--max-frames", type=int, default=0)
     cache_parser.add_argument("--sample-out", default=None)
+    cache_parser.add_argument("--workers", type=int, default=8)
 
     args = parser.parse_args()
     if args.cmd == "split":
@@ -673,6 +742,7 @@ def main() -> None:
         max_sequences=args.max_sequences,
         max_frames=args.max_frames,
         sample_out=args.sample_out,
+        workers=args.workers,
     )
 
 

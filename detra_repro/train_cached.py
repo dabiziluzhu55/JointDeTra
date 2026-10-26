@@ -3,13 +3,13 @@ import math
 import signal
 import sys
 import time
-from collections import deque
+from collections import defaultdict, deque
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
 
 import torch
-from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.utils.data import DataLoader, Subset, WeightedRandomSampler
 
 from detra_repro.checkpoints import (
     capture_rng_state,
@@ -86,6 +86,36 @@ def _ewta_top_k(step: int, anneal_steps: int, num_modes: int) -> int:
     return max(1, min(num_modes, int(round(1 + frac * (num_modes - 1)))))
 
 
+def stratified_sequence_indices(files: list[Path], frames_per_sequence: int) -> list[int]:
+    """Evenly spaced frames from every sequence directory.
+
+    ``files`` must already be in cache order. Sequence identity is the parent
+    directory, which is one RESOLVE ``batchId`` / one Waymo segment. The choice
+    is deterministic and does not depend on DataLoader shuffle.
+    """
+
+    if frames_per_sequence <= 0:
+        raise ValueError("frames_per_sequence must be > 0")
+    groups: dict[Path, list[int]] = defaultdict(list)
+    for index, path in enumerate(files):
+        groups[path.parent].append(index)
+    chosen: list[int] = []
+    for parent in sorted(groups):
+        idxs = groups[parent]
+        count = len(idxs)
+        if count <= frames_per_sequence:
+            chosen.extend(idxs)
+            continue
+        used: set[int] = set()
+        for slot in range(frames_per_sequence):
+            local = int(round(slot * (count - 1) / (frames_per_sequence - 1)))
+            if local in used:
+                continue
+            used.add(local)
+            chosen.append(idxs[local])
+    return chosen
+
+
 def build_loader(
     cache_dir: str | Path,
     batch_size: int,
@@ -97,10 +127,15 @@ def build_loader(
     num_workers: int = 0,
     pin_memory: bool = False,
     sample_weights: torch.Tensor | None = None,
-) -> tuple[CachedWaymoDataset, DataLoader]:
+    dataset: CachedWaymoDataset | None = None,
+    indices: list[int] | None = None,
+) -> tuple[CachedWaymoDataset | Subset, DataLoader]:
     """Build cached Waymo dataset and dataloader."""
 
-    dataset = CachedWaymoDataset(cache_dir)
+    if dataset is None:
+        dataset = CachedWaymoDataset(cache_dir)
+    if indices is not None:
+        dataset = Subset(dataset, indices)
     sampler = None
     if sample_weights is not None:
         generator = None
@@ -856,6 +891,8 @@ def _save_checkpoint(
     optimizer: torch.optim.Optimizer | None = None,
     lr_scheduler_state: dict[str, object] | None = None,
     training_state: dict[str, object] | None = None,
+    norm_type: str | None = None,
+    encoder_history_channels: int | None = None,
 ) -> None:
     """Atomically save model and, when supplied, full training state."""
 
@@ -874,6 +911,8 @@ def _save_checkpoint(
         "save_best_by": save_best_by,
         "save_best_metric": save_best_metric,
         "save_best_mode": save_best_mode,
+        "norm_type": norm_type,
+        "encoder_history_channels": encoder_history_channels,
         "rng_state": _capture_rng_state(),
     }
     if optimizer is not None:
@@ -895,9 +934,11 @@ def train_cached(
     max_map_tokens: int = 2048,
     lr: float = 1e-4,
     roi: tuple[float, float, float, float] = (-80.0, -80.0, 80.0, 80.0),
+    z_range: tuple[float, float] = (-4.0, 8.0),
     voxel_size: float = 0.1,
     eval_every: int = 10,
     val_batches: int | None = None,
+    val_frames_per_sequence: int = 0,
     initial_eval: bool = True,
     checkpoint_path: str | Path | None = None,
     resume_checkpoint: str | Path | None = None,
@@ -1061,7 +1102,12 @@ def train_cached(
         comet_run_name=comet_run_name,
         comet_tags=comet_tags or [],
     )
-    data_cfg = DataConfig(roi_m=roi, voxel_size_m=voxel_size, class_id_mode=class_id_mode)
+    data_cfg = DataConfig(
+        roi_m=tuple(roi),
+        voxel_size_m=voxel_size,
+        z_range_m=tuple(z_range),
+        class_id_mode=class_id_mode,
+    )
 
     # Need future + past horizons before constructing ModelConfig.
     train_dataset_probe = CachedWaymoDataset(train_cache)
@@ -1124,7 +1170,24 @@ def train_cached(
         sample_weights=train_sample_weights,
     )
     val_loader = None
+    eval_max_batches = val_batches
     if val_cache is not None:
+        val_dataset = CachedWaymoDataset(val_cache)
+        val_indices = None
+        if val_frames_per_sequence > 0:
+            val_indices = stratified_sequence_indices(val_dataset.files, val_frames_per_sequence)
+            n_sequences = len({path.parent for path in val_dataset.files})
+            print(
+                f"val_stratified sequences={n_sequences} frames={len(val_indices)} "
+                f"frames_per_sequence={val_frames_per_sequence} eval_batches=all",
+                flush=True,
+            )
+            if val_batches is not None:
+                print(
+                    "val_batches ignored: the stratified subset is evaluated in full",
+                    flush=True,
+                )
+            eval_max_batches = None
         _, val_loader = build_loader(
             val_cache,
             batch_size=batch_size,
@@ -1135,19 +1198,22 @@ def train_cached(
             deterministic_seed=deterministic_seed,
             num_workers=num_workers,
             pin_memory=use_pin_memory,
+            dataset=val_dataset,
+            indices=val_indices,
         )
 
+    encoder_history_channels = (
+        model_cfg.history_occupancy_channels
+        if gt_history_occupancy or dense_history_motion_weight > 0
+        else 0
+    )
     lidar_encoder = PaperLikeLidarEncoder(
         data_cfg,
         point_feature_dim=model_cfg.point_feature_dim,
         hidden_dim=model_cfg.hidden_dim,
         dynamic_conv_experts=model_cfg.dynamic_conv_experts,
         norm_type=norm_type,
-        history_occupancy_channels=(
-            model_cfg.history_occupancy_channels
-            if gt_history_occupancy or dense_history_motion_weight > 0
-            else 0
-        ),
+        history_occupancy_channels=encoder_history_channels,
     ).to(device)
     if proposal_head_type == "paper":
         # Paper A.3: FPN-fused stride-4 map -> separate 4-conv BN/ReLU score and
@@ -1357,6 +1423,8 @@ def train_cached(
             optimizer=optimizer,
             lr_scheduler_state=_scheduler_state(step),
             training_state=_training_state(step),
+            norm_type=norm_type,
+            encoder_history_channels=encoder_history_channels,
         )
 
     def _save_rolling_checkpoint(
@@ -1508,7 +1576,8 @@ def train_cached(
                 timing_step["data"] = timing_now - timing_last
                 timing_last = timing_now
 
-            pred, losses, targets = forward_batch(
+            try:
+                pred, losses, targets = forward_batch(
                 batch,
                 lidar_encoder,
                 proposal_head,
@@ -1553,6 +1622,19 @@ def train_cached(
             traj_occ_mode_weighting=traj_occ_mode_weighting,
                 compute_diagnostics=should_compute_full_train_metrics,
             )
+            except ValueError as exc:
+                # A single overflow makes every query non-finite and the matcher
+                # raises before the non-finite-loss skip below can run.
+                if "non-finite" not in str(exc) and "forward_batch failed" not in str(exc):
+                    raise
+                sample_paths = batch.get("sample_paths", [])
+                print(
+                    f"train step={step}/{steps} skipped_nonfinite_forward "
+                    f"sample_paths={sample_paths}",
+                    flush=True,
+                )
+                nonfinite_microbatch = True
+                break
             if profile_timing and micro_idx == 0:
                 _sync_for_timing(profile_timing_sync, device)
                 timing_now = time.monotonic()
@@ -1612,6 +1694,15 @@ def train_cached(
 
         if nonfinite_microbatch:
             optimizer.zero_grad(set_to_none=True)
+            weight_ok = all(
+                torch.isfinite(param).all()
+                for module in (lidar_encoder, proposal_head, map_encoder, model)
+                if module is not None
+                for param in module.parameters()
+                if param.is_floating_point()
+            )
+            if not weight_ok:
+                raise RuntimeError(f"train step={step} weights became non-finite; not continuing")
             continue
 
         grad_norm = torch.nn.utils.clip_grad_norm_(params, max_norm=grad_clip_max_norm)
@@ -1948,7 +2039,7 @@ def train_cached(
                 data_cfg,
                 model_cfg,
                 device,
-                max_batches=val_batches,
+                max_batches=eval_max_batches,
                 objective=objective,
                 proposal_mode=proposal_mode,
                 proposal_noise_std_m=proposal_noise_std_m,
@@ -2110,7 +2201,7 @@ def train_cached(
                     data_cfg,
                     model_cfg,
                     device,
-                    max_batches=val_batches,
+                    max_batches=eval_max_batches,
                     objective=objective,
                     proposal_mode=proposal_mode,
                     proposal_noise_std_m=proposal_noise_std_m,
@@ -2286,7 +2377,8 @@ def train_cached(
                 "roi": list(roi),
                 "voxel_size": voxel_size,
                 "eval_every": eval_every,
-                "val_batches": val_batches,
+                "val_batches": eval_max_batches,
+                "val_frames_per_sequence": val_frames_per_sequence,
                 "initial_eval": initial_eval,
                 "checkpoint_path": str(checkpoint_path) if checkpoint_path is not None else None,
                 "resume_checkpoint": str(resume_checkpoint) if resume_checkpoint is not None else None,
@@ -2408,9 +2500,19 @@ if __name__ == "__main__":
     parser.add_argument("--max-map-tokens", type=int, default=2048)
     parser.add_argument("--lr", type=float, default=8e-4)
     parser.add_argument("--roi", type=float, nargs=4, default=(-80.0, -80.0, 80.0, 80.0))
+    parser.add_argument("--z-range", type=float, nargs=2, default=(-4.0, 8.0))
     parser.add_argument("--voxel-size", type=float, default=0.1)
     parser.add_argument("--eval-every", type=int, default=10)
     parser.add_argument("--val-batches", type=int, default=None)
+    parser.add_argument(
+        "--val-frames-per-sequence",
+        type=int,
+        default=0,
+        help=(
+            "Validation frames taken evenly from each sequence directory. "
+            "When > 0, the whole subset is evaluated and --val-batches is ignored."
+        ),
+    )
     parser.add_argument(
         "--no-initial-eval",
         action="store_true",
@@ -2768,9 +2870,11 @@ if __name__ == "__main__":
         max_map_tokens=args.max_map_tokens,
         lr=args.lr,
         roi=tuple(args.roi),
+        z_range=tuple(args.z_range),
         voxel_size=args.voxel_size,
         eval_every=args.eval_every,
         val_batches=args.val_batches,
+        val_frames_per_sequence=args.val_frames_per_sequence,
         initial_eval=not args.no_initial_eval,
         checkpoint_path=args.checkpoint_path,
         resume_checkpoint=args.resume_checkpoint,

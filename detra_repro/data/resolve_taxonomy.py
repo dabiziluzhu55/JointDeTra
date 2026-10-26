@@ -60,10 +60,13 @@ FUTURE_DT_S = FRAME_STRIDE / HZ
 HORIZON_S = FUTURE_STEPS * FUTURE_DT_S
 TIMESTAMP_TOL_S = 0.05
 
-# Square BEV crop used by the paper encoder. About 1% of boxes lie outside.
-ROI_M = (-75.0, -75.0, 75.0, 75.0)
-# Roadside returns sit below the sensor. Official range is [-8, 0]; +2 keeps roofs.
-Z_RANGE_M = (-8.0, 2.0)
+# ``sunlakes_dataset.yaml`` lists [-60, -60, -8, 90, 80, 0]. Every sunlakes
+# detector except ``second.yaml`` overrides that with the range below
+# (centerpoint, transfusion, bevfusion, pointpillar, dsvt, ...).
+# (88.8 - (-60)) / 0.1 = 1488, which the BEV encoder can downsample by 16.
+POINT_CLOUD_RANGE = (-60.0, -60.0, -8.0, 88.8, 88.8, 0.0)
+ROI_M = (POINT_CLOUD_RANGE[0], POINT_CLOUD_RANGE[1], POINT_CLOUD_RANGE[3], POINT_CLOUD_RANGE[4])
+Z_RANGE_M = (POINT_CLOUD_RANGE[2], POINT_CLOUD_RANGE[5])
 VOXEL_SIZE_M = 0.1
 
 # nuScenes CVPR 2019 thresholds used by RESOLVE's detection eval.

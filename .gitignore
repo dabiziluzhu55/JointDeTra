@@ -11,3 +11,4 @@ __pycache__/
 /preds*.npz
 *.egg-info/
 .DS_Store
+/samples/

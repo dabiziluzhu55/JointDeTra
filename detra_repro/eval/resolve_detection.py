@@ -242,12 +242,20 @@ def evaluate_boxes_flat(gt_by_token: dict, pred_by_token: dict) -> dict:
 
 def boxes_from_cache(cache_dir: str | Path, *, as_predictions: bool = False) -> dict[str, list[dict]]:
     grouped: dict[str, list[dict]] = {}
-    for path in sorted(Path(cache_dir).glob("**/sample_*.npz")):
+    paths = sorted(Path(cache_dir).glob("sample_*.npz"))
+    paths.extend(sorted(Path(cache_dir).glob("*/sample_*.npz")))
+    for path in paths:
         with np.load(path, allow_pickle=True) as data:
             token = f"{data['context_name']}_{int(data['frame_index'])}"
             boxes = data["gt_boxes"].astype(np.float32).reshape(-1, 7)
             types = data["gt_types"].astype(np.int64)
             vel = data["gt_velocity"].astype(np.float32) if "gt_velocity" in data.files else np.zeros((len(boxes), 2), np.float32)
+            future = data["gt_future"].astype(np.float32) if "gt_future" in data.files else np.zeros((len(boxes), 0, 2), np.float32)
+            future_mask = (
+                data["gt_future_mask"].astype(bool)
+                if "gt_future_mask" in data.files
+                else np.zeros((len(boxes), future.shape[1]), dtype=bool)
+            )
             items = []
             for idx in range(len(boxes)):
                 name = CLASS_NAMES[int(types[idx])]
@@ -261,57 +269,164 @@ def boxes_from_cache(cache_dir: str | Path, *, as_predictions: bool = False) -> 
                         "name": name,
                         "score": 1.0,
                         "attr": "" if not as_predictions else _attribute(name, vel[idx]),
+                        "future_xy": future[idx],
+                        "future_mask": future_mask[idx],
+                        "mode_probs": np.ones((1,), dtype=np.float32),
                     }
                 )
             grouped[token] = items
     return grouped
 
 
+def _norm_type_from_state(state: dict) -> str:
+    """BatchNorm keeps running stats. GroupNorm does not."""
+
+    if any(str(key).endswith("running_mean") for key in state):
+        return "batch"
+    return "group"
+
+
+def _history_channels_from_state(state: dict) -> int:
+    """Width of the motion branch that is added back through ``motion_context_proj``."""
+
+    weight = state.get("history_occupancy_net.0.weight")
+    has_motion = any(str(key).startswith(("motion_aux_head.", "motion_context_proj.")) for key in state)
+    if weight is None:
+        if has_motion:
+            raise RuntimeError(
+                "checkpoint has motion_aux_head/motion_context_proj but no history_occupancy_net"
+            )
+        return 0
+    channels = int(weight.shape[1])
+    proj = state.get("motion_context_proj.weight")
+    head = state.get("motion_aux_head.3.weight")
+    if proj is None or head is None:
+        raise RuntimeError("history occupancy weights are present but the motion residual is not")
+    if int(proj.shape[1]) != channels * 3 or int(head.shape[0]) != channels * 3:
+        raise RuntimeError(
+            f"motion_context_proj width {tuple(proj.shape)} does not match {channels} occupancy channels"
+        )
+    return channels
+
+
+def _load_exact(module, state: dict, name: str) -> None:
+    """Load every checkpoint tensor. Mismatched architecture is an error."""
+
+    try:
+        module.load_state_dict(state, strict=True)
+    except RuntimeError as exc:
+        raise RuntimeError(f"{name} does not match the checkpoint architecture") from exc
+
+
+def load_resolve_modules(checkpoint, device: str):
+    """Rebuild the trained stack from the checkpoint, then strict-load every weight.
+
+    The saved ``DataConfig`` / ``ModelConfig`` fix the detection head, past-prediction
+    head, and map encoder. Normalization and the motion residual are read from the
+    lidar state dict, because those change tensor names without changing ``ModelConfig``.
+    """
+
+    import torch
+
+    from detra_repro.checkpoints import load_checkpoint
+    from detra_repro.config import DataConfig, ModelConfig
+    from detra_repro.models.bev import PaperLikeLidarEncoder
+    from detra_repro.models.proposals import PaperProposalHead, ProposalHead
+    from detra_repro.models.refinement import DeTraMini, build_map_encoder
+
+    ckpt = checkpoint if isinstance(checkpoint, dict) else load_checkpoint(checkpoint, device)
+    data_cfg = ckpt.get("data_cfg")
+    model_cfg = ckpt.get("model_cfg")
+    if not isinstance(data_cfg, DataConfig) or not isinstance(model_cfg, ModelConfig):
+        raise RuntimeError(
+            "checkpoint is missing data_cfg/model_cfg; refusing to rebuild a different network"
+        )
+    for name in ("lidar_encoder", "proposal_head", "map_encoder", "model"):
+        if name not in ckpt:
+            raise RuntimeError(f"checkpoint is missing {name}")
+
+    lidar_state = ckpt["lidar_encoder"]
+    proposal_state = ckpt["proposal_head"]
+    norm_type = _norm_type_from_state(lidar_state)
+    saved_norm = ckpt.get("norm_type")
+    if saved_norm is not None and saved_norm != norm_type:
+        raise RuntimeError(f"checkpoint norm_type={saved_norm} but lidar weights look like {norm_type}")
+    history_channels = _history_channels_from_state(lidar_state)
+    saved_channels = ckpt.get("encoder_history_channels")
+    if saved_channels is not None and int(saved_channels) != history_channels:
+        raise RuntimeError(
+            f"checkpoint encoder_history_channels={saved_channels} but weights have {history_channels}"
+        )
+    proposal_norm = _norm_type_from_state(proposal_state)
+    head_max_idx = max(
+        (
+            int(key.split(".")[1])
+            for key in proposal_state
+            if key.startswith("heatmap.") and key.split(".")[1].isdigit()
+        ),
+        default=0,
+    )
+
+    lidar = PaperLikeLidarEncoder(
+        data_cfg,
+        point_feature_dim=model_cfg.point_feature_dim,
+        hidden_dim=model_cfg.hidden_dim,
+        dynamic_conv_experts=model_cfg.dynamic_conv_experts,
+        norm_type=norm_type,
+        history_occupancy_channels=history_channels,
+    ).to(device)
+    if head_max_idx > 2:
+        proposal = PaperProposalHead(
+            model_cfg.hidden_dim,
+            num_convs=4,
+            norm_type=proposal_norm if proposal_norm in {"batch", "group"} else "group",
+        ).to(device)
+    else:
+        proposal = ProposalHead(model_cfg.hidden_dim).to(device)
+    map_encoder = build_map_encoder(model_cfg).to(device)
+    model = DeTraMini(model_cfg, data_cfg).to(device)
+    _load_exact(lidar, lidar_state, "lidar_encoder")
+    _load_exact(proposal, proposal_state, "proposal_head")
+    _load_exact(map_encoder, ckpt["map_encoder"], "map_encoder")
+    _load_exact(model, ckpt["model"], "model")
+    lidar.eval()
+    proposal.eval()
+    map_encoder.eval()
+    model.eval()
+    return ckpt, data_cfg, model_cfg, lidar, proposal, map_encoder, model
+
+
 def predictions_from_model(cache_dir: str | Path, checkpoint: str | Path, device: str) -> dict[str, list[dict]]:
-    """Run the full DeTra stack. Map tokens are used only when the mask is set."""
+    """Run the checkpoint's full stack, including the motion residual on the BEV map."""
 
     import torch
     from torch.utils.data import DataLoader
 
-    from detra_repro.config import DataConfig, ModelConfig
     from detra_repro.data.dataset import CachedWaymoDataset, collate_cached_waymo
-    from detra_repro.data.resolve import resolve_data_config
     from detra_repro.losses import current_boxes_from_pred
-    from detra_repro.models.bev import PaperLikeLidarEncoder
-    from detra_repro.models.proposals import PaperProposalHead
-    from detra_repro.models.refinement import DeTraMini, build_map_encoder
-    from detra_repro.train_cached import _load_compatible
 
-    ckpt = torch.load(checkpoint, map_location=device)
-    cfg = resolve_data_config()
-    data_cfg = DataConfig(roi_m=cfg.roi_m, voxel_size_m=cfg.voxel_size_m, class_id_mode="contiguous")
+    ckpt, data_cfg, model_cfg, lidar, proposal, map_encoder, model = load_resolve_modules(checkpoint, device)
     dataset = CachedWaymoDataset(cache_dir)
-    future_steps = int(dataset[0]["gt_future"].shape[1])
-    model_cfg = ModelConfig(num_classes=len(CLASS_NAMES), num_times=future_steps + 1)
-    lidar = PaperLikeLidarEncoder(data_cfg, point_feature_dim=4, hidden_dim=model_cfg.hidden_dim).to(device)
-    proposal = PaperProposalHead(model_cfg.hidden_dim, num_convs=4, norm_type="group").to(device)
-    map_encoder = build_map_encoder(model_cfg).to(device) if "map_encoder" in ckpt else None
-    model = DeTraMini(model_cfg, data_cfg).to(device)
-    _load_compatible(lidar, ckpt["lidar_encoder"])
-    _load_compatible(proposal, ckpt["proposal_head"])
-    if map_encoder is not None and "map_encoder" in ckpt:
-        _load_compatible(map_encoder, ckpt["map_encoder"])
-    _load_compatible(model, ckpt["model"])
-    lidar.eval()
-    proposal.eval()
-    model.eval()
-    if map_encoder is not None:
-        map_encoder.eval()
+    print(f"checkpoint_step={ckpt.get('step')} device={device} frames={len(dataset)}", flush=True)
     loader = DataLoader(
         dataset,
         batch_size=1,
         shuffle=False,
         num_workers=0,
-        collate_fn=lambda samples: collate_cached_waymo(samples, max_points=400000, max_objects=600, max_map_tokens=16),
+        collate_fn=lambda samples: collate_cached_waymo(
+            samples,
+            max_points=400000,
+            max_objects=max(model_cfg.num_queries, 4096),
+            max_map_tokens=16,
+        ),
     )
     grouped: dict[str, list[dict]] = {}
+    seen = 0
     with torch.no_grad():
         for batch in loader:
+            seen += 1
+            if seen == 1 or seen % 50 == 0:
+                print(f"infer {seen}/{len(dataset)}", flush=True)
             points = batch["points"].to(device)
             point_mask = batch["point_mask"].to(device)
             encoded = lidar(points, point_mask=point_mask)
@@ -342,13 +457,17 @@ def predictions_from_model(cache_dir: str | Path, checkpoint: str | Path, device
             prob = pred["class_logits"][0].softmax(dim=-1)
             cls = prob.argmax(dim=-1)
             score = obj * prob.gather(1, cls[:, None]).squeeze(1)
-            mode = pred["mode_logits"][0].argmax(dim=-1)
-            future_xy = pred["poses"][0, torch.arange(mode.shape[0], device=device), mode, 1, :2]
-            velocity = (future_xy - boxes[:, :2]) / FUTURE_DT_S
+            mode_probs = pred["mode_logits"][0].softmax(dim=-1)
+            mode = mode_probs.argmax(dim=-1)
+            future_all = pred["future_xy"][0]
+            future_top = future_all[torch.arange(mode.shape[0], device=device), mode, 0, :]
+            velocity = (future_top - boxes[:, :2]) / FUTURE_DT_S
             keep = torch.topk(score, k=min(DET_MAX_BOXES, score.shape[0])).indices
             token = f"{batch['context_names'][0]}_{int(batch['frame_indices'][0])}"
+            future_keep = future_all[keep].detach().cpu().numpy()
+            prob_keep = mode_probs[keep].detach().cpu().numpy()
             items = []
-            for idx in keep.tolist():
+            for local_idx, idx in enumerate(keep.tolist()):
                 name = CLASS_NAMES[int(cls[idx])]
                 vel = velocity[idx].detach().cpu().numpy()
                 box = boxes[idx].detach().cpu().numpy()
@@ -362,6 +481,8 @@ def predictions_from_model(cache_dir: str | Path, checkpoint: str | Path, device
                         "name": name,
                         "score": float(score[idx]),
                         "attr": _attribute(name, vel),
+                        "future_xy": future_keep[local_idx],
+                        "mode_probs": prob_keep[local_idx],
                     }
                 )
             grouped[token] = items
@@ -387,7 +508,14 @@ def main() -> None:
     else:
         raise SystemExit("pass --gt-as-pred or --checkpoint")
     summary = evaluate_boxes(gt, pred)
-    text = json.dumps({k: summary[k] for k in ("mean_ap", "nd_score", "tp_errors", "mean_dist_aps", "distance_bins")}, indent=2)
+    from detra_repro.eval.resolve_forecast import evaluate_end_to_end
+
+    if pred and all("future_xy" in box for boxes in pred.values() for box in boxes[:1]):
+        summary["forecast"] = evaluate_end_to_end(gt, pred)
+    text = json.dumps(
+        {k: summary[k] for k in ("mean_ap", "nd_score", "tp_errors", "mean_dist_aps", "distance_bins", "forecast") if k in summary},
+        indent=2,
+    )
     print(text)
     if args.out:
         Path(args.out).write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")

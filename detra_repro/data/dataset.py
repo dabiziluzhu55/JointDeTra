@@ -46,7 +46,10 @@ class CachedWaymoDataset(Dataset):
                 f"{manifest_path}: cache schema {manifest_version}, "
                 f"required {self.require_schema_version}"
             )
-        self.files = sorted(self.cache_dir.glob("**/sample_*.npz"))
+        # One directory level only. Auxiliary dumps such as cameras/sample_*.npz
+        # sit deeper and are not cache-v2 training samples.
+        self.files = sorted(self.cache_dir.glob("sample_*.npz"))
+        self.files.extend(sorted(self.cache_dir.glob("*/sample_*.npz")))
         if not self.files:
             raise FileNotFoundError(f"No sample_*.npz files found under {self.cache_dir}")
 

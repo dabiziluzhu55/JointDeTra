@@ -47,6 +47,19 @@ def capture_rng_state() -> dict[str, object]:
     return state
 
 
+def _cpu_byte_tensor(value: torch.Tensor) -> torch.Tensor:
+    """Return a CPU ``ByteTensor``.
+
+    ``load_checkpoint`` maps every tensor onto the training device, and both
+    CPU and CUDA generators reject a CUDA byte tensor.
+    """
+
+    value = value.detach().cpu().contiguous()
+    if isinstance(value, torch.ByteTensor):
+        return value
+    return torch.ByteTensor(value.to(torch.uint8).numpy())
+
+
 def restore_rng_state(state: dict[str, object] | None) -> None:
     """Restore RNG state from a full-state checkpoint when available."""
 
@@ -57,9 +70,13 @@ def restore_rng_state(state: dict[str, object] | None) -> None:
     if "numpy" in state:
         np.random.set_state(state["numpy"])
     if "torch" in state:
-        torch.set_rng_state(state["torch"])
+        torch.set_rng_state(_cpu_byte_tensor(state["torch"]))
     if "cuda" in state and torch.cuda.is_available():
-        torch.cuda.set_rng_state_all(state["cuda"])
+        cuda_state = [_cpu_byte_tensor(item) for item in state["cuda"]]
+        if len(cuda_state) == torch.cuda.device_count():
+            torch.cuda.set_rng_state_all(cuda_state)
+        elif cuda_state:
+            torch.cuda.set_rng_state(cuda_state[0])
 
 
 def save_checkpoint_atomic(path: str | Path, payload: dict[str, Any]) -> None:
